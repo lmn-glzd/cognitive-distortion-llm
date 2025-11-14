@@ -1,24 +1,23 @@
-# src/llm_rerun_hard_cases.py
+# src/llm_runner.py
 
+import pandas as pd
 import json
 import time
 from pathlib import Path
 
-import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
 from prompts import build_prompt
 
-# ---------------------------------------------
-# 1. CONFIG
-# ---------------------------------------------
+# -----------------------------------------------------------------------
+# 1. CONFIGURATION
+# -----------------------------------------------------------------------
 
-MODEL_NAME = "gpt-4o-mini"  # İstəsən yalnız bu skript üçün gpt-4o yaza bilərsən
+MODEL_NAME = "gpt-4o-mini"
 INPUT_CSV = "data/merged.csv"
-INPUT_RESULTS = "results/llm_results.csv"
-OUTPUT_RESULTS = "results/llm_results_v2.csv"
+OUTPUT_CSV = "results/llm_results.csv"
 
 LABELS = [
     "All-or-Nothing Thinking",
@@ -34,26 +33,25 @@ LABELS = [
     "Should statements",
 ]
 
-HARD_LABELS = [
-    "Magnification",
-    "Mental filter",
-    "Should statements",
-    "No Distortion",
-]
+RESULTS_PATH = Path(OUTPUT_CSV)
 
-ERROR_LABELS = ["ERROR", "PARSE_ERROR", "RATE_LIMIT_ERROR"]
+
+# -----------------------------------------------------------------------
+# 2. OPENAI CLIENT
+# -----------------------------------------------------------------------
 
 client = OpenAI()
 
 
-# ---------------------------------------------
-# 2. RETRY LAYER
-# ---------------------------------------------
+# -----------------------------------------------------------------------
+# 3. RETRY MECHANISM FOR OPENAI CALLS
+# -----------------------------------------------------------------------
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=60))
 def call_llm(prompt: str) -> str:
     """
-    LLM call with retries. Raises RetryError if still failing.
+    Sends prompt to OpenAI with automatic retries.
+    Raises RetryError if still failing after retries.
     """
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -62,50 +60,49 @@ def call_llm(prompt: str) -> str:
     )
     content = response.choices[0].message.content
     if isinstance(content, list):
-        text = "".join(
-            part.get("text", "") for part in content if isinstance(part, dict)
-        )
+        text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
     else:
         text = content
     return text
 
 
-# ---------------------------------------------
-# 3. MAIN
-# ---------------------------------------------
+# -----------------------------------------------------------------------
+# 4. HELPER: AUTO-DETECT START INDEX & PRELOAD OLD RESULTS
+# -----------------------------------------------------------------------
 
-def main():
-    print("🔄 Loading gold dataset & previous LLM results...")
-    df = pd.read_csv(INPUT_CSV)            # columns: Text, Label, source
-    res = pd.read_csv(INPUT_RESULTS)       # columns: index, text, extracted, reasoning, predicted_label, ...
+def load_existing_results():
+    """
+    Əgər əvvəldən llm_results.csv varsa:
+      - onu oxuyur
+      - results listinə çevirir
+      - start_index = max(index) + 1 qaytarır
+    Yoxdursa:
+      - boş results və start_index = 0 qaytarır.
+    """
+    if RESULTS_PATH.exists():
+        prev = pd.read_csv(RESULTS_PATH)
+        if "index" in prev.columns and len(prev) > 0:
+            start_index = int(prev["index"].max()) + 1
+            print(f"🔁 Existing results found. Will continue from index {start_index}.")
+            return prev.to_dict("records"), start_index
+    print("🆕 No previous results found. Starting from index 0.")
+    return [], 0
 
-    # Gold label-ları index-ə bağlayaq
-    gold = df.reset_index().rename(columns={"index": "index", "Label": "gold_label"})
 
-    merged = res.merge(gold[["index", "gold_label"]], on="index", how="left")
+# -----------------------------------------------------------------------
+# 5. MAIN LLM PROCESSING LOOP
+# -----------------------------------------------------------------------
 
-    # Rerun edəcəyimiz sətirlər:
-    #  - gold label HARD_LABELS siyahısına düşənlər
-    #  - və ya predicted_label ERROR tipində olanlar
-    mask_hard = merged["gold_label"].isin(HARD_LABELS)
-    mask_error = merged["predicted_label"].isin(ERROR_LABELS)
+def run_llm():
+    print("🔄 Loading dataset...")
+    df = pd.read_csv(INPUT_CSV)
 
-    to_rerun_indices = sorted(merged[mask_hard | mask_error]["index"].unique())
-    print(f"🔍 Rows to re-run: {len(to_rerun_indices)}")
+    # load previous results if exist
+    results, start_index = load_existing_results()
 
-    if not to_rerun_indices:
-        print("✅ No rows selected for re-run. Exiting.")
-        return
-
-    # Nəticələri index-ə görə rahat update etmək üçün
-    res = res.set_index("index")
-
-    for i in tqdm(to_rerun_indices):
-        try:
-            text = df.loc[i, "Text"]
-        except KeyError:
-            print(f"⚠️ Warning: index {i} not found in merged.csv, skipping.")
-            continue
+    print("🚀 Starting LLM inference...")
+    for i in tqdm(range(start_index, len(df))):
+        text = df.loc[i, "Text"]  # sütun adın: Text
 
         prompt = build_prompt(text, LABELS)
 
@@ -113,50 +110,70 @@ def main():
             try:
                 raw_output = call_llm(prompt)
             except RetryError as e:
+                # çox güman RateLimitError və ya davamlı network error
                 print(f"⚠️ RetryError at row {i}: {e}")
-                res.loc[i, "extracted"] = ""
-                res.loc[i, "reasoning"] = ""
-                res.loc[i, "predicted_label"] = "RATE_LIMIT_ERROR"
+                results.append({
+                    "index": i,
+                    "text": text,
+                    "extracted": "",
+                    "reasoning": "",
+                    "predicted_label": "RATE_LIMIT_ERROR",
+                })
+                # çox yüklənməmək üçün bir az böyük pauza ver
                 time.sleep(30)
                 continue
 
+            # JSON parse
             try:
                 parsed = json.loads(raw_output)
             except json.JSONDecodeError:
-                # JSON parse alınmadı
-                print(f"⚠️ JSON parse error at row {i}")
-                res.loc[i, "extracted"] = ""
-                res.loc[i, "reasoning"] = ""
-                res.loc[i, "predicted_label"] = "PARSE_ERROR"
+                # JSON formatında olmayan cavab
+                results.append({
+                    "index": i,
+                    "text": text,
+                    "extracted": "",
+                    "reasoning": "",
+                    "predicted_label": "PARSE_ERROR",
+                })
                 continue
 
-            # Uğurlu nəticə
-            res.loc[i, "text"] = text
-            res.loc[i, "extracted"] = parsed.get("extracted", "")
-            res.loc[i, "reasoning"] = parsed.get("reasoning", "")
-            res.loc[i, "predicted_label"] = parsed.get("label", "")
+            results.append({
+                "index": i,
+                "text": text,
+                "extracted": parsed.get("extracted", ""),
+                "reasoning": parsed.get("reasoning", ""),
+                "predicted_label": parsed.get("label", ""),
+            })
 
         except Exception as e:
             print(f"⚠️ Unexpected error at row {i}: {e}")
-            res.loc[i, "extracted"] = ""
-            res.loc[i, "reasoning"] = ""
-            res.loc[i, "predicted_label"] = "ERROR"
+            results.append({
+                "index": i,
+                "text": text,
+                "extracted": "",
+                "reasoning": "",
+                "predicted_label": "ERROR",
+            })
 
-        # Hər 50 sətirdən bir intermediate save
-        if i % 50 == 0:
-            out_path = Path(OUTPUT_RESULTS)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            res.reset_index().to_csv(out_path, index=False)
-            print(f"💾 Partial save after index {i}")
+        # hər 50 sətirdən bir save
+        if i > 0 and i % 50 == 0:
+            temp_df = pd.DataFrame(results)
+            RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temp_df.to_csv(RESULTS_PATH, index=False)
+            print(f"💾 Progress saved at row {i}")
 
-        time.sleep(1.0)  # rate-limit üçün kiçik pauza
+        # rate-limit riskini azaltmaq üçün
+        time.sleep(1.0)
 
-    # Final save
-    out_path = Path(OUTPUT_RESULTS)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    res.reset_index().to_csv(out_path, index=False)
-    print(f"🎉 Done. Saved updated results to {OUTPUT_RESULTS}")
+    final_df = pd.DataFrame(results)
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    final_df.to_csv(RESULTS_PATH, index=False)
+    print("🎉 All done! Saved to results/llm_results.csv")
 
+
+# -----------------------------------------------------------------------
+# 6. RUN  
+# -----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    run_llm()
