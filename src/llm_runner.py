@@ -49,6 +49,10 @@ def call_llm(prompt):
 # -----------------------------------------------------------------------
 # 3. MAIN LOOP
 # -----------------------------------------------------------------------
+import os
+
+# Ensure results folder exists
+os.makedirs("results", exist_ok=True)
 
 def run_llm():
     print("🔄 Loading dataset...")
