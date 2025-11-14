@@ -11,50 +11,43 @@ from prompts import build_prompt
 # 1. CONFIGURATION
 # -----------------------------------------------------------------------
 
-MODEL_NAME = "gpt-4o-mini"   # istəsən sonra dəyişərsən
+MODEL_NAME = "gpt-4.1-mini"
 INPUT_CSV = "data/merged.csv"
 OUTPUT_CSV = "results/llm_results.csv"
-START_INDEX = 0   # qaldığın yerdən davam etmək üçün dəyişə bilərsən
+START_INDEX = 0
 
 LABELS = [
-    "Overgeneralization",
-    "Catastrophizing",
-    "Personalization",
-    "Mind Reading",
+    "All-or-Nothing Thinking",
     "Emotional Reasoning",
-    "Should Statements",
+    "Fortune-telling",
     "Labeling",
-    "Black-and-White Thinking",
+    "Magnification",
+    "Mental filter",
+    "Mind Reading",
+    "No Distortion",
+    "Overgeneralization",
+    "Personalization",
+    "Should statements",
 ]
-# Burada öz datasetində olan distortions yazılmalıdır.
-
 
 # -----------------------------------------------------------------------
-# 2. OPENAI CLIENT
-# -----------------------------------------------------------------------
-
-client = OpenAI()
-
-
-# -----------------------------------------------------------------------
-# 3. RETRY MECHANISM FOR OPENAI CALLS
+# 2. RETRY + OPENAI CALL
 # -----------------------------------------------------------------------
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=20))
 def call_llm(prompt):
-    """
-    Sends prompt to OpenAI with automatic retries.
-    """
-    response = client.chat.completions.create(
+    client = OpenAI()
+
+    response = client.responses.create(
         model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        input=prompt
     )
-    return response.choices[0].message["content"]
+
+    return response.output_text
 
 
 # -----------------------------------------------------------------------
-# 4. MAIN LLM PROCESSING LOOP
+# 3. MAIN LOOP
 # -----------------------------------------------------------------------
 
 def run_llm():
@@ -68,13 +61,11 @@ def run_llm():
     for i in tqdm(range(START_INDEX, len(df))):
         text = df.loc[i, "text"]
 
-        # Build ERD-style prompt
         prompt = build_prompt(text, LABELS)
 
         try:
             raw_output = call_llm(prompt)
 
-            # try to parse JSON output
             parsed = json.loads(raw_output)
 
             results.append({
@@ -95,22 +86,18 @@ def run_llm():
                 "predicted_label": "ERROR"
             })
 
-        # save progress every 50 samples
         if i % 50 == 0 and i > 0:
-            temp_df = pd.DataFrame(results)
-            temp_df.to_csv(OUTPUT_CSV, index=False)
+            pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
             print(f"💾 Progress saved at row {i}")
 
-        time.sleep(0.3)  # small delay to avoid rate limits
+        time.sleep(0.3)
 
-    # Final save
-    final_df = pd.DataFrame(results)
-    final_df.to_csv(OUTPUT_CSV, index=False)
+    pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
     print("🎉 All done! Saved to results/llm_results.csv")
 
 
 # -----------------------------------------------------------------------
-# 5. RUN
+# 4. RUN
 # -----------------------------------------------------------------------
 
 if __name__ == "__main__":
