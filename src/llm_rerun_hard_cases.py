@@ -15,8 +15,7 @@ from prompts import build_prompt
 # 1. CONFIG
 # ---------------------------------------------
 
-MODEL_NAME = "gpt-4o-mini"  # İstəsən yalnız bu skript üçün gpt-4o yaza bilərsən
-INPUT_CSV = "data/merged.csv"
+MODEL_NAME = "gpt-4o-mini"
 INPUT_RESULTS = "results/llm_results.csv"
 OUTPUT_RESULTS = "results/llm_results_v2.csv"
 
@@ -34,6 +33,7 @@ LABELS = [
     "Should statements",
 ]
 
+# Bunlar LLM üçün xüsusilə çətin hesab etdiyimiz label-lərdir
 HARD_LABELS = [
     "Magnification",
     "Mental filter",
@@ -41,6 +41,7 @@ HARD_LABELS = [
     "No Distortion",
 ]
 
+# Bu label-lər texniki səhvləri göstərir
 ERROR_LABELS = ["ERROR", "PARSE_ERROR", "RATE_LIMIT_ERROR"]
 
 client = OpenAI()
@@ -75,37 +76,34 @@ def call_llm(prompt: str) -> str:
 # ---------------------------------------------
 
 def main():
-    print("🔄 Loading gold dataset & previous LLM results...")
-    df = pd.read_csv(INPUT_CSV)            # columns: Text, Label, source
-    res = pd.read_csv(INPUT_RESULTS)       # columns: index, text, extracted, reasoning, predicted_label, ...
+    print("🔄 Loading previous LLM results...")
+    res = pd.read_csv(INPUT_RESULTS)
 
-    # Gold label-ları index-ə bağlayaq
-    gold = df.reset_index().rename(columns={"index": "index", "Label": "gold_label"})
+    if "index" not in res.columns:
+        raise ValueError("llm_results.csv must contain an 'index' column.")
 
-    merged = res.merge(gold[["index", "gold_label"]], on="index", how="left")
+    # Sətirləri seçirik:
+    #  - predicted_label ERROR tipində olanlar
+    #  - predicted_label HARD_LABELS siyahısına düşənlər
+    mask_error = res["predicted_label"].isin(ERROR_LABELS)
+    mask_hard_pred = res["predicted_label"].isin(HARD_LABELS)
 
-    # Rerun edəcəyimiz sətirlər:
-    #  - gold label HARD_LABELS siyahısına düşənlər
-    #  - və ya predicted_label ERROR tipində olanlar
-    mask_hard = merged["gold_label"].isin(HARD_LABELS)
-    mask_error = merged["predicted_label"].isin(ERROR_LABELS)
+    to_rerun_ids = sorted(res.loc[mask_error | mask_hard_pred, "index"].unique())
+    print(f"🔍 Rows to re-run (by 'index' column): {len(to_rerun_ids)}")
 
-    to_rerun_indices = sorted(merged[mask_hard | mask_error]["index"].unique())
-    print(f"🔍 Rows to re-run: {len(to_rerun_indices)}")
-
-    if not to_rerun_indices:
+    if not to_rerun_ids:
         print("✅ No rows selected for re-run. Exiting.")
         return
 
-    # Nəticələri index-ə görə rahat update etmək üçün
+    # 'index' sütununu DataFrame index-ə çeviririk ki, rahat update edək
     res = res.set_index("index")
 
-    for i in tqdm(to_rerun_indices):
-        try:
-            text = df.loc[i, "Text"]
-        except KeyError:
-            print(f"⚠️ Warning: index {i} not found in merged.csv, skipping.")
+    for n, i in enumerate(tqdm(to_rerun_ids, desc="Re-running hard/error cases"), start=1):
+        if i not in res.index:
+            print(f"⚠️ Warning: index {i} not found in llm_results DataFrame, skipping.")
             continue
+
+        text = res.loc[i, "text"]
 
         prompt = build_prompt(text, LABELS)
 
@@ -123,7 +121,6 @@ def main():
             try:
                 parsed = json.loads(raw_output)
             except json.JSONDecodeError:
-                # JSON parse alınmadı
                 print(f"⚠️ JSON parse error at row {i}")
                 res.loc[i, "extracted"] = ""
                 res.loc[i, "reasoning"] = ""
@@ -131,7 +128,6 @@ def main():
                 continue
 
             # Uğurlu nəticə
-            res.loc[i, "text"] = text
             res.loc[i, "extracted"] = parsed.get("extracted", "")
             res.loc[i, "reasoning"] = parsed.get("reasoning", "")
             res.loc[i, "predicted_label"] = parsed.get("label", "")
@@ -143,11 +139,11 @@ def main():
             res.loc[i, "predicted_label"] = "ERROR"
 
         # Hər 50 sətirdən bir intermediate save
-        if i % 50 == 0:
+        if n % 50 == 0:
             out_path = Path(OUTPUT_RESULTS)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             res.reset_index().to_csv(out_path, index=False)
-            print(f"💾 Partial save after index {i}")
+            print(f"💾 Partial save after {n} rows (up to index {i})")
 
         time.sleep(1.0)  # rate-limit üçün kiçik pauza
 
